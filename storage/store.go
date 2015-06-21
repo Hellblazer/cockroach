@@ -1204,6 +1204,15 @@ func (s *Store) Descriptor() (*proto.StoreDescriptor, error) {
 // method, args & reply into a Raft Cmd struct and executes the
 // command using the fetched range.
 func (s *Store) ExecuteCmd(ctx context.Context, call proto.Call) error {
+	return s.ExecuteCmdWithCallback(ctx, call, nil)
+}
+
+// ExecuteCmdWithCallback is called from ExecuteCmd. When a debug
+// callback is not nil, it will be called whenever the command is
+// executed (and retried).
+//
+// The method is exposed for testing.
+func (s *Store) ExecuteCmdWithCallback(ctx context.Context, call proto.Call, dbgCallback func()) error {
 	args, reply := call.Args, call.Reply
 	ctx = s.Context(ctx)
 	// If the request has a zero timestamp, initialize to this node's clock.
@@ -1237,6 +1246,10 @@ func (s *Store) ExecuteCmd(ctx context.Context, call proto.Call) error {
 	retryOpts.Tag = fmt.Sprintf("store: %s", args.Method())
 	err := retry.WithBackoff(retryOpts, func() (retry.Status, error) {
 		// Add the command to the range for execution; exit retry loop on success.
+
+		if dbgCallback != nil {
+			dbgCallback()
+		}
 		reply.Reset()
 
 		// Get range and add command to the range for execution.

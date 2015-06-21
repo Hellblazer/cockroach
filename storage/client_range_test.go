@@ -18,12 +18,17 @@
 package storage_test
 
 import (
+	"bytes"
+	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
@@ -148,5 +153,158 @@ func TestRejectFutureCommand(t *testing.T) {
 	}
 	if v := mustGetInteger(val); v != 15 {
 		t.Errorf("expected 15, got %v", v)
+	}
+}
+
+// Test a case where a put operation of an older timestamp comes after
+// a put operation of a newer timestamp.
+//
+// 1) Txn executes a put operation with time T.
+// 2) Before the txn is committed, another client sends a get
+//    operation with time T+100. This triggers the txn restart.
+// 3) The client sends another get operation with time T+200. The
+//    write intent is resolved (and the txn timestamp is pushed to
+//    T+200), but the actual get operation has not yet been executed (and
+//    hence the timestamp cache has not been updated).
+// 4) The restarted txn executes the put operation again. The timestamp
+//    of the operation is T+100, and it will be ignored.
+//
+// QUESTION(kaneda): Ignoring the out-of-order put operation causes a bit
+// weird behavior. In the above example, a get issued in the same txn
+// after Step 4 will not see the put.
+func TestOutOfOrderPut(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	manualClock := hlc.NewManualClock(0)
+	clock := hlc.NewClock(manualClock.UnixNano)
+	store, stopper := createTestStoreWithEngine(t,
+		engine.NewInMem(proto.Attributes{}, 10<<20),
+		clock,
+		true,
+		nil)
+	defer stopper.Stop()
+
+	// Put an initial value.
+	key := "key"
+	val0 := []byte("val0")
+	err := store.DB().Put(key, val0)
+	if err != nil {
+		t.Fatalf("failed to get: %s", err)
+	}
+
+	wait1 := make(chan struct{})
+	wait2 := make(chan struct{})
+	wait3 := make(chan struct{})
+	wait4 := make(chan struct{})
+	wait5 := make(chan struct{})
+
+	go func() {
+		epoch := -1
+		// Start a txn that does read-after-write.
+		// The txn will be restarted twice, and the out-of-order put
+		// will happen in the second epoch.
+		if err := store.DB().Txn(func(txn *client.Txn) error {
+			epoch++
+
+			if epoch == 1 {
+				// Wait until the second get operation is issued.
+				close(wait3)
+				<-wait4
+			}
+
+			val1 := []byte("val1")
+			if err := txn.Put(key, val1); err != nil {
+				return err
+			}
+
+			actual, err := txn.Get(key)
+			if err != nil {
+				return err
+			}
+			if epoch != 1 {
+				if !bytes.Equal(actual.ValueBytes(), val1) {
+					t.Fatalf("Unexpected get result: %s", actual)
+				}
+			} else {
+				// The put was ignored since its timestamp is smaller than
+				// the meta timestamp, which was pushed by the second get operation.
+				//
+				// QUESTION(kaneda): The behavior is a bit weird... Is this acceptable?
+				if !bytes.Equal(actual.ValueBytes(), val0) {
+					t.Fatalf("Unexpected get result: %s", actual)
+				}
+			}
+
+			if epoch == 0 {
+				// Wait until the first get operation that will push the txn timestamp.
+				close(wait1)
+				<-wait2
+			}
+
+			b := &client.Batch{}
+			return txn.Commit(b)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if epoch != 2 {
+			t.Fatalf("Unexpected number of txn retry: %d", epoch)
+		}
+
+		close(wait5)
+	}()
+
+	<-wait1
+
+	// Advance the clock and send a get operation with higher
+	// priority to trigger the txn restart.
+	manualClock.Increment(100)
+
+	lSender := kv.NewLocalSender()
+	lSender.AddStore(store)
+	sender := kv.NewTxnCoordSender(lSender, clock, false, stopper)
+	db, err := client.Open(fmt.Sprintf("//root@?priority=%d", math.MaxInt32), client.SenderOpt(sender))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Get(key)
+	if err != nil {
+		t.Fatalf("failed to get: %s", err)
+	}
+
+	// Wait until the txn is restarted.
+	close(wait2)
+	<-wait3
+
+	// Advance the clock and send a get operation again. This time
+	// we add an artificial delay between the write intent resolve
+	// and the following get operation.
+	manualClock.Increment(100)
+
+	priority := int32(math.MaxInt32)
+	getCall := proto.Call{
+		Args: &proto.GetRequest{
+			RequestHeader: proto.RequestHeader{
+				Key:          proto.Key(key),
+				RaftID:       1,
+				Replica:      proto.Replica{StoreID: store.StoreID()},
+				UserPriority: &priority,
+			},
+		},
+		Reply: &proto.GetResponse{},
+	}
+
+	attempt := 0
+	err = store.ExecuteCmdWithCallback(context.Background(), getCall, func() {
+		// The first attempt will fail and the write intent will be resolved.
+		// Do not run the get operation after the intent is resolved.
+		attempt++
+		if attempt == 2 {
+			close(wait4)
+			<-wait5
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
