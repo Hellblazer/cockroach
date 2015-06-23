@@ -186,17 +186,17 @@ func TestOutOfOrderPut(t *testing.T) {
 
 	// Put an initial value.
 	key := "key"
-	val0 := []byte("val0")
-	err := store.DB().Put(key, val0)
+	initVal := []byte("initVal")
+	err := store.DB().Put(key, initVal)
 	if err != nil {
 		t.Fatalf("failed to get: %s", err)
 	}
 
-	wait1 := make(chan struct{})
-	wait2 := make(chan struct{})
-	wait3 := make(chan struct{})
-	wait4 := make(chan struct{})
-	wait5 := make(chan struct{})
+	waitPut := make(chan struct{})
+	waitFirstGet := make(chan struct{})
+	waitTxnRestart := make(chan struct{})
+	waitSecondGet := make(chan struct{})
+	waitTxnComplete := make(chan struct{})
 
 	go func() {
 		epoch := -1
@@ -208,12 +208,12 @@ func TestOutOfOrderPut(t *testing.T) {
 
 			if epoch == 1 {
 				// Wait until the second get operation is issued.
-				close(wait3)
-				<-wait4
+				close(waitTxnRestart)
+				<-waitSecondGet
 			}
 
-			val1 := []byte("val1")
-			if err := txn.Put(key, val1); err != nil {
+			updatedVal := []byte("updatedVal")
+			if err := txn.Put(key, updatedVal); err != nil {
 				return err
 			}
 
@@ -222,7 +222,7 @@ func TestOutOfOrderPut(t *testing.T) {
 				return err
 			}
 			if epoch != 1 {
-				if !bytes.Equal(actual.ValueBytes(), val1) {
+				if !bytes.Equal(actual.ValueBytes(), updatedVal) {
 					t.Fatalf("Unexpected get result: %s", actual)
 				}
 			} else {
@@ -230,15 +230,15 @@ func TestOutOfOrderPut(t *testing.T) {
 				// the meta timestamp, which was pushed by the second get operation.
 				//
 				// QUESTION(kaneda): The behavior is a bit weird... Is this acceptable?
-				if !bytes.Equal(actual.ValueBytes(), val0) {
+				if !bytes.Equal(actual.ValueBytes(), initVal) {
 					t.Fatalf("Unexpected get result: %s", actual)
 				}
 			}
 
 			if epoch == 0 {
-				// Wait until the first get operation that will push the txn timestamp.
-				close(wait1)
-				<-wait2
+				// Wait until the first get operation will push the txn timestamp.
+				close(waitPut)
+				<-waitFirstGet
 			}
 
 			b := &client.Batch{}
@@ -251,10 +251,10 @@ func TestOutOfOrderPut(t *testing.T) {
 			t.Fatalf("Unexpected number of txn retry: %d", epoch)
 		}
 
-		close(wait5)
+		close(waitTxnComplete)
 	}()
 
-	<-wait1
+	<-waitPut
 
 	// Advance the clock and send a get operation with higher
 	// priority to trigger the txn restart.
@@ -274,8 +274,8 @@ func TestOutOfOrderPut(t *testing.T) {
 	}
 
 	// Wait until the txn is restarted.
-	close(wait2)
-	<-wait3
+	close(waitFirstGet)
+	<-waitTxnRestart
 
 	// Advance the clock and send a get operation again. This time
 	// we add an artificial delay between the write intent resolve
@@ -301,8 +301,8 @@ func TestOutOfOrderPut(t *testing.T) {
 		// Do not run the get operation after the intent is resolved.
 		attempt++
 		if attempt == 2 {
-			close(wait4)
-			<-wait5
+			close(waitSecondGet)
+			<-waitTxnComplete
 		}
 	})
 	if err != nil {
