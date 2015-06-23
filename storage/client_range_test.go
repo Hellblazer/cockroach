@@ -159,15 +159,16 @@ func TestRejectFutureCommand(t *testing.T) {
 // Test a case where a put operation of an older timestamp comes after
 // a put operation of a newer timestamp.
 //
-// 1) Txn executes a put operation with time T.
-// 2) Before the txn is committed, another client sends a get
+// 1) Writer executes a put operation with time T in a txn.
+// 2) Before the txn is committed, Reader sends a get
 //    operation with time T+100. This triggers the txn restart.
-// 3) The client sends another get operation with time T+200. The
+// 3) Reader sends another get operation with time T+200. The
 //    write intent is resolved (and the txn timestamp is pushed to
 //    T+200), but the actual get operation has not yet been executed (and
 //    hence the timestamp cache has not been updated).
-// 4) The restarted txn executes the put operation again. The timestamp
-//    of the operation is T+100, and it will be ignored.
+// 4) Writer restarts the txn and executes the put operation
+//    again. The timestamp of the operation is T+100, and it will be
+//    ignored.
 //
 // QUESTION(kaneda): Ignoring the out-of-order put operation causes a bit
 // weird behavior. In the above example, a get issued in the same txn
