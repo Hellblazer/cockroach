@@ -168,10 +168,6 @@ func TestRejectFutureCommand(t *testing.T) {
 // 4) Writer restarts the txn and executes the put operation
 //    again. The timestamp of the operation is T+100, and it will be
 //    ignored.
-//
-// QUESTION(kaneda): Ignoring the out-of-order put operation causes a bit
-// weird behavior. In the above example, a get issued in the same txn
-// after Step 4 will not see the put.
 func TestOutOfOrderPut(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	manualClock := hlc.NewManualClock(0)
@@ -221,18 +217,8 @@ func TestOutOfOrderPut(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if epoch != 1 {
-				if !bytes.Equal(actual.ValueBytes(), updatedVal) {
-					t.Fatalf("Unexpected get result: %s", actual)
-				}
-			} else {
-				// The put was ignored since its timestamp is smaller than
-				// the meta timestamp, which was pushed by the second get operation.
-				//
-				// QUESTION(kaneda): The behavior is a bit weird... Is this acceptable?
-				if !bytes.Equal(actual.ValueBytes(), initVal) {
-					t.Fatalf("Unexpected get result: %s", actual)
-				}
+			if !bytes.Equal(actual.ValueBytes(), updatedVal) {
+				t.Fatalf("Unexpected get result: %s", actual)
 			}
 
 			if epoch == 0 {

@@ -738,8 +738,8 @@ func mvccPutInternal(engine Engine, ms *MVCCStats, key proto.Key, timestamp prot
 				// The current Put operation does not come from the same
 				// transaction.
 				return &proto.WriteIntentError{Intents: []proto.Intent{{Key: key, Txn: *meta.Txn}}}
-			} else if txn.Epoch < meta.Txn.Epoch || timestamp.Less(meta.Timestamp) {
-				// Ignore old writes from the current transaction; it's just an
+			} else if txn.Epoch < meta.Txn.Epoch {
+				// Ignore old epoch writes from the current transaction; it's just an
 				// RPC arriving out of order.
 				return nil
 			}
