@@ -19,7 +19,6 @@ package storage_test
 
 import (
 	"bytes"
-	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -28,8 +27,8 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/client"
-	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
@@ -198,6 +197,7 @@ func TestOutOfOrderPut(t *testing.T) {
 	waitSecondGet := make(chan struct{})
 	waitTxnComplete := make(chan struct{})
 
+	// Start a writer.
 	go func() {
 		epoch := -1
 		// Start a txn that does read-after-write.
@@ -242,7 +242,8 @@ func TestOutOfOrderPut(t *testing.T) {
 			}
 
 			b := &client.Batch{}
-			return txn.Commit(b)
+			err = txn.Commit(b)
+			return err
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -260,52 +261,63 @@ func TestOutOfOrderPut(t *testing.T) {
 	// priority to trigger the txn restart.
 	manualClock.Increment(100)
 
-	lSender := kv.NewLocalSender()
-	lSender.AddStore(store)
-	sender := kv.NewTxnCoordSender(lSender, clock, false, stopper)
-	db, err := client.Open(fmt.Sprintf("//root@?priority=%d", math.MaxInt32), client.SenderOpt(sender))
-	if err != nil {
-		t.Fatal(err)
+	priority := int32(math.MaxInt32)
+	requestHeader := proto.RequestHeader{
+		Key:          proto.Key(key),
+		RaftID:       1,
+		Replica:      proto.Replica{StoreID: store.StoreID()},
+		UserPriority: &priority,
+		Timestamp:    clock.Now(),
 	}
-
-	_, err = db.Get(key)
+	getCall := proto.Call{
+		Args: &proto.GetRequest{
+			RequestHeader: requestHeader,
+		},
+		Reply: &proto.GetResponse{},
+	}
+	err = store.ExecuteCmd(context.Background(), getCall)
 	if err != nil {
 		t.Fatalf("failed to get: %s", err)
 	}
 
-	// Wait until the txn is restarted.
+	// Wait until the writer restarts the txn.
 	close(waitFirstGet)
 	<-waitTxnRestart
 
 	// Advance the clock and send a get operation again. This time
-	// we add an artificial delay between the write intent resolve
-	// and the following get operation.
+	// we use TestingCommandFilter so that a get operation is not
+	// processed after the write intent is resolved (to prevent the
+	// timestamp cache from being updated).
 	manualClock.Increment(100)
 
-	priority := int32(math.MaxInt32)
-	getCall := proto.Call{
+	requestHeader.Timestamp = clock.Now()
+	getCall = proto.Call{
 		Args: &proto.GetRequest{
-			RequestHeader: proto.RequestHeader{
-				Key:          proto.Key(key),
-				RaftID:       1,
-				Replica:      proto.Replica{StoreID: store.StoreID()},
-				UserPriority: &priority,
-			},
+			RequestHeader: requestHeader,
 		},
 		Reply: &proto.GetResponse{},
 	}
 
-	attempt := 0
-	err = store.ExecuteCmdWithCallback(context.Background(), getCall, func() {
-		// The first attempt will fail and the write intent will be resolved.
-		// Do not run the get operation after the intent is resolved.
-		attempt++
-		if attempt == 2 {
-			close(waitSecondGet)
-			<-waitTxnComplete
+	numGets := 0
+	storage.TestingCommandFilter = func(args proto.Request, reply proto.Response) bool {
+		if _, ok := args.(*proto.GetRequest); ok && args.Header().Key.Equal(proto.Key(key)) {
+			// The first attempt will fail and the write intent will be resolved.
+			// Do not run the get operation after the intent is resolved.
+			numGets++
+			if numGets == 2 {
+				reply.Header().SetGoError(util.Errorf("Test"))
+				return true
+			}
 		}
-	})
-	if err != nil {
-		t.Fatal(err)
+		return false
 	}
+
+	err = store.ExecuteCmd(context.Background(), getCall)
+	if err == nil {
+		t.Fatal("Unexpected success of get")
+	}
+	storage.TestingCommandFilter = nil
+
+	close(waitSecondGet)
+	<-waitTxnComplete
 }
